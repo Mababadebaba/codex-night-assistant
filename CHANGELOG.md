@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- Fixed missed active-task detection when a Codex turn is reasoning or newly restarted before any tool call appears.
+- Added active turn tracking from recent incomplete Codex turns, while still clearing immediately on `task_complete`.
+- Stabilized quota display by using the newest local `token_count` event instead of letting older session logs overwrite newer values.
+- Hardened JSONL tail reading for UTF-8 BOM-prefixed lines.
+
 ## 0.1.2
 
 - Fixed false active-task detection after Codex work finished by separating active tool calls/processes from recent session traces.
