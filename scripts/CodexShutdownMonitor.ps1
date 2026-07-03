@@ -128,13 +128,61 @@ function Test-RateLimitBlocked {
 
     try {
         if ($RateLimits.rate_limit_reached_type) { return $true }
-        if ($RateLimits.primary -and [double]$RateLimits.primary.used_percent -ge 100) { return $true }
-        if ($RateLimits.secondary -and [double]$RateLimits.secondary.used_percent -ge 100) { return $true }
+        foreach ($bucket in (Get-RateLimitBuckets -RateLimits $RateLimits)) {
+            if ($null -ne $bucket.UsedPercent -and [double]$bucket.UsedPercent -ge 100) {
+                return $true
+            }
+        }
     } catch {
         return $false
     }
 
     return $false
+}
+
+function Add-RateLimitBuckets {
+    param($Object, [string]$Prefix, [ref]$Buckets, [int]$Depth = 0)
+
+    if ($null -eq $Object -or $Depth -gt 4) { return }
+    if ($Object -is [string] -or $Object -is [ValueType]) { return }
+
+    foreach ($prop in $Object.PSObject.Properties) {
+        $value = $prop.Value
+        if ($null -eq $value) { continue }
+        if ($prop.Name -eq "rate_limit_reached_type") { continue }
+
+        $name = if ([string]::IsNullOrWhiteSpace($Prefix)) { $prop.Name } else { "$Prefix.$($prop.Name)" }
+        if ($value -is [string] -or $value -is [ValueType]) { continue }
+
+        $used = $null
+        foreach ($field in @("used_percent", "usage_percent", "percent_used", "percent")) {
+            $fieldProp = $value.PSObject.Properties[$field]
+            if ($fieldProp -and $null -ne $fieldProp.Value) {
+                try {
+                    $used = [double]$fieldProp.Value
+                    break
+                } catch {
+                }
+            }
+        }
+
+        if ($null -ne $used) {
+            $Buckets.Value += [pscustomobject]@{
+                Name = $name
+                UsedPercent = $used
+            }
+        }
+
+        Add-RateLimitBuckets -Object $value -Prefix $name -Buckets $Buckets -Depth ($Depth + 1)
+    }
+}
+
+function Get-RateLimitBuckets {
+    param($RateLimits)
+
+    $buckets = @()
+    Add-RateLimitBuckets -Object $RateLimits -Prefix "" -Buckets ([ref]$buckets)
+    return $buckets
 }
 
 function Get-RateLimitText {
@@ -143,11 +191,8 @@ function Get-RateLimitText {
 
     try {
         $parts = @()
-        if ($RateLimits.primary -and $null -ne $RateLimits.primary.used_percent) {
-            $parts += "primary $([math]::Round([double]$RateLimits.primary.used_percent, 1))%"
-        }
-        if ($RateLimits.secondary -and $null -ne $RateLimits.secondary.used_percent) {
-            $parts += "secondary $([math]::Round([double]$RateLimits.secondary.used_percent, 1))%"
+        foreach ($bucket in (Get-RateLimitBuckets -RateLimits $RateLimits | Sort-Object Name | Select-Object -First 6)) {
+            $parts += "$($bucket.Name) $([math]::Round([double]$bucket.UsedPercent, 1))%"
         }
         if ($RateLimits.rate_limit_reached_type) {
             $parts += "blocked $($RateLimits.rate_limit_reached_type)"
@@ -163,11 +208,9 @@ function Get-MaxRateLimitPercent {
     param($RateLimits)
     $max = $null
     try {
-        foreach ($value in @($RateLimits.primary.used_percent, $RateLimits.secondary.used_percent)) {
-            if ($null -ne $value) {
-                $number = [double]$value
-                if ($null -eq $max -or $number -gt $max) { $max = $number }
-            }
+        foreach ($bucket in (Get-RateLimitBuckets -RateLimits $RateLimits)) {
+            $number = [double]$bucket.UsedPercent
+            if ($null -eq $max -or $number -gt $max) { $max = $number }
         }
     } catch {
     }
@@ -188,7 +231,7 @@ function Get-CodexGlobalActivity {
     $recentFileCount = 0
     $activeProcessCount = 0
     $pendingToolCalls = @{}
-    $activeTurns = @{}
+    $recentTurns = @{}
 
     if (Test-Path -LiteralPath $processManagerPath) {
         try {
@@ -241,8 +284,8 @@ function Get-CodexGlobalActivity {
                     $latestActivity = $eventTime
                 }
 
-                if ($event.type -eq "turn_context" -and $turnId -and $eventTime -ge $rateWindowStart) {
-                    $activeTurns[$turnId] = $true
+                if ($turnId -and $eventTime -and $eventTime -ge $rateWindowStart) {
+                    $recentTurns[$turnId] = $true
                 }
 
                 if ($event.type -eq "response_item") {
@@ -250,21 +293,18 @@ function Get-CodexGlobalActivity {
                     $callId = [string]$event.payload.call_id
 
                     if ($payloadType -eq "function_call" -or $payloadType -eq "custom_tool_call") {
-                        if ($turnId) { $activeTurns[$turnId] = $true }
-                        if ($callId) { $pendingToolCalls[$callId] = $true }
+                        if ($callId) { $pendingToolCalls[$callId] = $turnId }
                     } elseif ($payloadType -eq "function_call_output" -or $payloadType -eq "custom_tool_call_output") {
                         if ($callId -and $pendingToolCalls.ContainsKey($callId)) {
                             $pendingToolCalls.Remove($callId)
                         }
-                    } elseif ($payloadType -eq "message" -and $turnId) {
-                        $activeTurns[$turnId] = $true
                     }
                 }
 
                 if ($event.type -eq "event_msg") {
                     if ($event.payload.type -eq "task_complete" -and $turnId) {
-                        if ($activeTurns.ContainsKey($turnId)) {
-                            $activeTurns.Remove($turnId)
+                        if ($recentTurns.ContainsKey($turnId)) {
+                            $recentTurns.Remove($turnId)
                         }
                     }
 
@@ -280,9 +320,15 @@ function Get-CodexGlobalActivity {
         }
     }
 
+    $activeTurns = @{}
     foreach ($key in @($pendingToolCalls.Keys)) {
         if ([string]::IsNullOrWhiteSpace([string]$key)) {
             $pendingToolCalls.Remove($key)
+            continue
+        }
+        $pendingTurnId = [string]$pendingToolCalls[$key]
+        if (-not [string]::IsNullOrWhiteSpace($pendingTurnId)) {
+            $activeTurns[$pendingTurnId] = $true
         }
     }
 
@@ -291,6 +337,7 @@ function Get-CodexGlobalActivity {
         ActiveProcessCount = $activeProcessCount
         PendingToolCallCount = $pendingToolCalls.Count
         ActiveTurnCount = $activeTurns.Count
+        RecentTurnCount = $recentTurns.Count
         RateLimitBlocked = $rateLimitBlocked
         RateLimitText = $rateLimitText
         RateLimitUsedPercent = $rateLimitPercent
@@ -313,6 +360,7 @@ try {
         ActiveProcessCount = 0
         PendingToolCallCount = 0
         ActiveTurnCount = 0
+        RecentTurnCount = 0
         RateLimitBlocked = $false
         RateLimitText = "initializing"
         RateLimitUsedPercent = $null
@@ -332,8 +380,7 @@ try {
 
         $taskActive = (
             $activity.ActiveProcessCount -gt 0 -or
-            $activity.PendingToolCallCount -gt 0 -or
-            $activity.ActiveTurnCount -gt 0
+            $activity.PendingToolCallCount -gt 0
         )
         $idleFor = ((Get-Date) - $lastCodexActivity).TotalMinutes
         $decision = ""
@@ -372,6 +419,7 @@ try {
             ActiveProcessCount = $activity.ActiveProcessCount
             PendingToolCallCount = $activity.PendingToolCallCount
             ActiveTurnCount = $activity.ActiveTurnCount
+            RecentTurnCount = $activity.RecentTurnCount
             RateLimitBlocked = [bool]$activity.RateLimitBlocked
             RateLimitText = $activity.RateLimitText
             RateLimitUsedPercent = $activity.RateLimitUsedPercent
@@ -381,7 +429,7 @@ try {
             Decision = $decision
         }
         Write-MonitorStatus -Status $status
-        Write-MonitorLog "Check: active=$taskActive turns=$($activity.ActiveTurnCount) tools=$($activity.PendingToolCallCount) processes=$($activity.ActiveProcessCount) idleFor=$([math]::Round($idleFor, 2)) rateLimit=$($activity.RateLimitBlocked) readyChecks=$readyChecks decision=$decision"
+        Write-MonitorLog "Check: active=$taskActive activeTurns=$($activity.ActiveTurnCount) recentTurns=$($activity.RecentTurnCount) tools=$($activity.PendingToolCallCount) processes=$($activity.ActiveProcessCount) idleFor=$([math]::Round($idleFor, 2)) rateLimit=$($activity.RateLimitBlocked) readyChecks=$readyChecks decision=$decision"
 
         if ($shutdownReady) {
             Write-MonitorLog "Shutdown condition confirmed. Waiting for UI confirmation."
