@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- Fixed false active-task detection after Codex work finished by separating active tool calls/processes from recent session traces.
+- Recent session count is now informational and no longer blocks the idle shutdown flow.
+- Fixed rate-limit handling so any exhausted quota bucket, or any explicit Codex rate-limit block signal, is treated as quota exhaustion.
+- Updated live status wording to show active calls, active processes, recent sessions, quota state, and the current shutdown decision more clearly.
+- Cleared stale monitor status when monitoring is stopped so old results are not shown as live progress.
+
 ## 0.1.1
 
 - Fixed shutdown gating so rate-limit exhaustion alone no longer triggers shutdown while Codex tasks are still active.
