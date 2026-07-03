@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- Fixed stale monitor status being shown after the hidden background monitor process had already stopped.
+- Split task progress into task state and task details so active turn/call/process counts are no longer clipped in the UI.
+- Normalized the displayed decision against the live active-task counters to avoid contradictory text.
+
 ## 0.1.3
 
 - Fixed missed active-task detection when a Codex turn is reasoning or newly restarted before any tool call appears.
