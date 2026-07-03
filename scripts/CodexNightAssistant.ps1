@@ -118,7 +118,7 @@ function Show-ShutdownConfirmation {
     $message.Location = New-Object System.Drawing.Point(22, 18)
     $message.Size = New-Object System.Drawing.Size(400, 112)
     $recentTurns = if ($null -ne $MonitorStatus.RecentTurnCount) { [int]$MonitorStatus.RecentTurnCount } else { 0 }
-    $message.Text = "已满足自动关机条件：`r`n$ReasonText`r`n`r`n任务：活跃调用 $($MonitorStatus.PendingToolCallCount) / 活跃进程 $($MonitorStatus.ActiveProcessCount) / 最近会话 $recentTurns`r`n额度：$($MonitorStatus.RateLimitText)"
+    $message.Text = "已满足自动关机条件：`r`n$ReasonText`r`n`r`n任务：活跃回合 $($MonitorStatus.ActiveTurnCount) / 活跃调用 $($MonitorStatus.PendingToolCallCount) / 活跃进程 $($MonitorStatus.ActiveProcessCount)`r`n最近会话：$recentTurns`r`n额度：$($MonitorStatus.RateLimitText)"
     $confirmForm.Controls.Add($message)
 
     $countdownLabel = New-Object System.Windows.Forms.Label
@@ -210,9 +210,10 @@ function Update-MonitorProgress {
     try {
         $status = Get-Content -Raw -LiteralPath $script:monitorStatusPath -Encoding UTF8 | ConvertFrom-Json
         $recentTurns = if ($null -ne $status.RecentTurnCount) { [int]$status.RecentTurnCount } else { [int]$status.ActiveTurnCount }
-        $activeTotal = [int]$status.PendingToolCallCount + [int]$status.ActiveProcessCount
+        $activeTotal = [int]$status.ActiveTurnCount + [int]$status.PendingToolCallCount + [int]$status.ActiveProcessCount
         $taskState = if ($activeTotal -gt 0) { "运行中" } else { "未检测到活跃任务" }
         $rateState = if ([bool]$status.RateLimitBlocked) { "任一额度已耗尽/受限" } else { "未检测到耗尽" }
+        $rateUpdated = if ($status.RateLimitUpdatedAt) { " 更新 $($status.RateLimitUpdatedAt)" } else { "" }
         $decisionText = switch -Regex ([string]$status.Decision) {
             "^INITIALIZING$" { "后台监控正在初始化。"; break }
             "^RATE_BLOCKED_BUT_TASKS_ACTIVE$" { "额度已耗尽，但仍检测到任务未结束，继续等待。"; break }
@@ -224,8 +225,8 @@ function Update-MonitorProgress {
             default { [string]$status.Decision }
         }
 
-        $taskProgressLabel.Text = "任务进度：$taskState  活跃调用 $($status.PendingToolCallCount) / 活跃进程 $($status.ActiveProcessCount) / 最近会话 $recentTurns"
-        $quotaProgressLabel.Text = "额度状态：$rateState  $($status.RateLimitText)"
+        $taskProgressLabel.Text = "任务进度：$taskState  活跃回合 $($status.ActiveTurnCount) / 活跃调用 $($status.PendingToolCallCount) / 活跃进程 $($status.ActiveProcessCount) / 最近会话 $recentTurns"
+        $quotaProgressLabel.Text = "额度状态：$rateState  $($status.RateLimitText)$rateUpdated"
         $decisionProgressLabel.Text = "当前判断：$decisionText"
         Set-Status "全局监控中：$decisionText"
 
