@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+- Fixed shutdown gating so rate-limit exhaustion alone no longer triggers shutdown while Codex tasks are still active.
+- Added live monitor status for active turns, pending tool calls, active processes, and rate-limit progress.
+- Replaced slow log tail reading with a bounded fast tail reader for large Codex session logs.
+- Removed all direct shutdown calls from the hidden background monitor; shutdown now requires the main UI confirmation dialog.
+- Enforced the configured continuous idle threshold even when a rate limit is detected.
+- Added a confirmation countdown: No cancels automatic shutdown, and no response shuts down only after the countdown.
+
 ## 0.1.0
 
 - Initial open-source release.
