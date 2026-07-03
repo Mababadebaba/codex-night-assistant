@@ -90,6 +90,7 @@ function Stop-MonitorProcess {
         }
         Remove-Item -LiteralPath $script:monitorPidPath -Force -ErrorAction SilentlyContinue
     }
+    Remove-Item -LiteralPath $script:monitorStatusPath -Force -ErrorAction SilentlyContinue
 }
 
 function Show-ShutdownConfirmation {
@@ -116,7 +117,8 @@ function Show-ShutdownConfirmation {
     $message = New-Object System.Windows.Forms.Label
     $message.Location = New-Object System.Drawing.Point(22, 18)
     $message.Size = New-Object System.Drawing.Size(400, 112)
-    $message.Text = "已满足自动关机条件：`r`n$ReasonText`r`n`r`n任务：会话 $($MonitorStatus.ActiveTurnCount) / 调用 $($MonitorStatus.PendingToolCallCount) / 进程 $($MonitorStatus.ActiveProcessCount)`r`n额度：$($MonitorStatus.RateLimitText)"
+    $recentTurns = if ($null -ne $MonitorStatus.RecentTurnCount) { [int]$MonitorStatus.RecentTurnCount } else { 0 }
+    $message.Text = "已满足自动关机条件：`r`n$ReasonText`r`n`r`n任务：活跃调用 $($MonitorStatus.PendingToolCallCount) / 活跃进程 $($MonitorStatus.ActiveProcessCount) / 最近会话 $recentTurns`r`n额度：$($MonitorStatus.RateLimitText)"
     $confirmForm.Controls.Add($message)
 
     $countdownLabel = New-Object System.Windows.Forms.Label
@@ -191,24 +193,26 @@ function Show-ShutdownConfirmation {
 function Update-MonitorProgress {
     if (-not $taskProgressLabel -or -not $quotaProgressLabel -or -not $decisionProgressLabel) { return }
 
+    if (-not $script:globalMonitor) {
+        $taskProgressLabel.Text = "任务进度：未开启监控"
+        $quotaProgressLabel.Text = "额度状态：未开启监控"
+        $decisionProgressLabel.Text = "当前判断：未开启监控"
+        return
+    }
+
     if (-not (Test-Path -LiteralPath $script:monitorStatusPath)) {
-        if ($script:globalMonitor) {
-            $taskProgressLabel.Text = "任务进度：等待后台监控写入状态..."
-            $quotaProgressLabel.Text = "额度进度：等待读取"
-            $decisionProgressLabel.Text = "当前判断：正在初始化"
-        } else {
-            $taskProgressLabel.Text = "任务进度：未开启监控"
-            $quotaProgressLabel.Text = "额度进度：未开启监控"
-            $decisionProgressLabel.Text = "当前判断：未开启监控"
-        }
+        $taskProgressLabel.Text = "任务进度：等待后台监控写入状态..."
+        $quotaProgressLabel.Text = "额度状态：等待读取"
+        $decisionProgressLabel.Text = "当前判断：正在初始化"
         return
     }
 
     try {
         $status = Get-Content -Raw -LiteralPath $script:monitorStatusPath -Encoding UTF8 | ConvertFrom-Json
-        $activeTotal = [int]$status.ActiveTurnCount + [int]$status.PendingToolCallCount + [int]$status.ActiveProcessCount
+        $recentTurns = if ($null -ne $status.RecentTurnCount) { [int]$status.RecentTurnCount } else { [int]$status.ActiveTurnCount }
+        $activeTotal = [int]$status.PendingToolCallCount + [int]$status.ActiveProcessCount
         $taskState = if ($activeTotal -gt 0) { "运行中" } else { "未检测到活跃任务" }
-        $rateState = if ([bool]$status.RateLimitBlocked) { "已耗尽/受限" } else { "正常或未受限" }
+        $rateState = if ([bool]$status.RateLimitBlocked) { "任一额度已耗尽/受限" } else { "未检测到耗尽" }
         $decisionText = switch -Regex ([string]$status.Decision) {
             "^INITIALIZING$" { "后台监控正在初始化。"; break }
             "^RATE_BLOCKED_BUT_TASKS_ACTIVE$" { "额度已耗尽，但仍检测到任务未结束，继续等待。"; break }
@@ -220,8 +224,8 @@ function Update-MonitorProgress {
             default { [string]$status.Decision }
         }
 
-        $taskProgressLabel.Text = "任务进度：$taskState  会话 $($status.ActiveTurnCount) / 调用 $($status.PendingToolCallCount) / 进程 $($status.ActiveProcessCount)"
-        $quotaProgressLabel.Text = "额度进度：$rateState  $($status.RateLimitText)"
+        $taskProgressLabel.Text = "任务进度：$taskState  活跃调用 $($status.PendingToolCallCount) / 活跃进程 $($status.ActiveProcessCount) / 最近会话 $recentTurns"
+        $quotaProgressLabel.Text = "额度状态：$rateState  $($status.RateLimitText)"
         $decisionProgressLabel.Text = "当前判断：$decisionText"
         Set-Status "全局监控中：$decisionText"
 
@@ -234,7 +238,7 @@ function Update-MonitorProgress {
         }
     } catch {
         $taskProgressLabel.Text = "任务进度：状态读取失败"
-        $quotaProgressLabel.Text = "额度进度：状态读取失败"
+        $quotaProgressLabel.Text = "额度状态：状态读取失败"
         $decisionProgressLabel.Text = "当前判断：$($_.Exception.Message)"
     }
 }
@@ -275,8 +279,10 @@ function Test-RateLimitBlocked {
 
     try {
         if ($RateLimits.rate_limit_reached_type) { return $true }
-        if ($RateLimits.primary -and [double]$RateLimits.primary.used_percent -ge 100) { return $true }
-        if ($RateLimits.secondary -and [double]$RateLimits.secondary.used_percent -ge 100) { return $true }
+        $json = $RateLimits | ConvertTo-Json -Depth 8 -Compress
+        foreach ($match in [regex]::Matches($json, '"(?:used_percent|usage_percent|percent_used|percent)"\s*:\s*([0-9]+(?:\.[0-9]+)?)')) {
+            if ([double]$match.Groups[1].Value -ge 100) { return $true }
+        }
     } catch {
         return $false
     }
@@ -484,7 +490,7 @@ $taskProgressLabel.ForeColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
 $form.Controls.Add($taskProgressLabel)
 
 $quotaProgressLabel = New-Object System.Windows.Forms.Label
-$quotaProgressLabel.Text = "额度进度：未开启监控"
+$quotaProgressLabel.Text = "额度状态：未开启监控"
 $quotaProgressLabel.Location = New-Object System.Drawing.Point(24, 368)
 $quotaProgressLabel.Size = New-Object System.Drawing.Size(400, 24)
 $quotaProgressLabel.ForeColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
