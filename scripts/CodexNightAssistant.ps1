@@ -28,6 +28,9 @@ $script:shutdownDelaySetting = 0
 $script:logPath = Join-Path $PSScriptRoot "CodexNightAssistant.log"
 $script:monitorScript = Join-Path $PSScriptRoot "CodexShutdownMonitor.ps1"
 $script:monitorPidPath = Join-Path $PSScriptRoot "CodexShutdownMonitor.pid"
+$script:monitorStatusPath = Join-Path $PSScriptRoot "CodexShutdownMonitor.status.json"
+$script:shutdownPromptActive = $false
+$script:lastShutdownPromptKey = ""
 
 function Write-AppLog {
     param([string]$Message)
@@ -86,6 +89,153 @@ function Stop-MonitorProcess {
             Write-AppLog "Stop monitor process failed: $($_.Exception.Message)"
         }
         Remove-Item -LiteralPath $script:monitorPidPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-ShutdownConfirmation {
+    param($MonitorStatus, [string]$ReasonText)
+
+    if ($script:shutdownPromptActive) { return }
+    $script:shutdownPromptActive = $true
+
+    $countdown = [int]$script:shutdownDelaySetting
+    if ($countdown -lt 60) { $countdown = 60 }
+
+    Write-AppLog "Shutdown confirmation shown: countdown=$countdown reason=$ReasonText"
+
+    $confirmForm = New-Object System.Windows.Forms.Form
+    $confirmForm.Text = "确认关机"
+    $confirmForm.StartPosition = "CenterScreen"
+    $confirmForm.Size = New-Object System.Drawing.Size(460, 260)
+    $confirmForm.MinimumSize = New-Object System.Drawing.Size(460, 260)
+    $confirmForm.MaximumSize = New-Object System.Drawing.Size(460, 260)
+    $confirmForm.TopMost = $true
+    $confirmForm.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 248)
+    $confirmForm.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
+
+    $message = New-Object System.Windows.Forms.Label
+    $message.Location = New-Object System.Drawing.Point(22, 18)
+    $message.Size = New-Object System.Drawing.Size(400, 112)
+    $message.Text = "已满足自动关机条件：`r`n$ReasonText`r`n`r`n任务：会话 $($MonitorStatus.ActiveTurnCount) / 调用 $($MonitorStatus.PendingToolCallCount) / 进程 $($MonitorStatus.ActiveProcessCount)`r`n额度：$($MonitorStatus.RateLimitText)"
+    $confirmForm.Controls.Add($message)
+
+    $countdownLabel = New-Object System.Windows.Forms.Label
+    $countdownLabel.Location = New-Object System.Drawing.Point(22, 138)
+    $countdownLabel.Size = New-Object System.Drawing.Size(400, 28)
+    $countdownLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 11, [System.Drawing.FontStyle]::Bold)
+    $confirmForm.Controls.Add($countdownLabel)
+
+    $yesButton = New-Object System.Windows.Forms.Button
+    $yesButton.Text = "现在关机"
+    $yesButton.Location = New-Object System.Drawing.Point(72, 176)
+    $yesButton.Size = New-Object System.Drawing.Size(130, 36)
+    $confirmForm.Controls.Add($yesButton)
+
+    $noButton = New-Object System.Windows.Forms.Button
+    $noButton.Text = "否，取消自动关机"
+    $noButton.Location = New-Object System.Drawing.Point(224, 176)
+    $noButton.Size = New-Object System.Drawing.Size(160, 36)
+    $confirmForm.Controls.Add($noButton)
+
+    $remaining = $countdown
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+
+    $updateCountdown = {
+        $countdownLabel.Text = "无人操作将在 $remaining 秒后关机"
+    }
+
+    $timer.Add_Tick({
+        $remaining -= 1
+        & $updateCountdown
+        if ($remaining -le 0) {
+            $timer.Stop()
+            Write-AppLog "Shutdown confirmation countdown elapsed"
+            Stop-GlobalMonitor
+            Request-Shutdown -DelaySeconds 0
+            $confirmForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $confirmForm.Close()
+        }
+    })
+
+    $yesButton.Add_Click({
+        $timer.Stop()
+        Write-AppLog "Shutdown confirmation accepted manually"
+        Stop-GlobalMonitor
+        Request-Shutdown -DelaySeconds 0
+        $confirmForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $confirmForm.Close()
+    })
+
+    $noButton.Add_Click({
+        $timer.Stop()
+        Write-AppLog "Shutdown confirmation rejected manually"
+        Stop-GlobalMonitor
+        Cancel-Shutdown
+        Set-Status "已取消自动关机和全局监控。"
+        $confirmForm.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $confirmForm.Close()
+    })
+
+    $confirmForm.Add_FormClosed({
+        $timer.Stop()
+        $timer.Dispose()
+        $script:shutdownPromptActive = $false
+    })
+
+    & $updateCountdown
+    $timer.Start()
+    [void]$confirmForm.ShowDialog($form)
+}
+
+function Update-MonitorProgress {
+    if (-not $taskProgressLabel -or -not $quotaProgressLabel -or -not $decisionProgressLabel) { return }
+
+    if (-not (Test-Path -LiteralPath $script:monitorStatusPath)) {
+        if ($script:globalMonitor) {
+            $taskProgressLabel.Text = "任务进度：等待后台监控写入状态..."
+            $quotaProgressLabel.Text = "额度进度：等待读取"
+            $decisionProgressLabel.Text = "当前判断：正在初始化"
+        } else {
+            $taskProgressLabel.Text = "任务进度：未开启监控"
+            $quotaProgressLabel.Text = "额度进度：未开启监控"
+            $decisionProgressLabel.Text = "当前判断：未开启监控"
+        }
+        return
+    }
+
+    try {
+        $status = Get-Content -Raw -LiteralPath $script:monitorStatusPath -Encoding UTF8 | ConvertFrom-Json
+        $activeTotal = [int]$status.ActiveTurnCount + [int]$status.PendingToolCallCount + [int]$status.ActiveProcessCount
+        $taskState = if ($activeTotal -gt 0) { "运行中" } else { "未检测到活跃任务" }
+        $rateState = if ([bool]$status.RateLimitBlocked) { "已耗尽/受限" } else { "正常或未受限" }
+        $decisionText = switch -Regex ([string]$status.Decision) {
+            "^INITIALIZING$" { "后台监控正在初始化。"; break }
+            "^RATE_BLOCKED_BUT_TASKS_ACTIVE$" { "额度已耗尽，但仍检测到任务未结束，继续等待。"; break }
+            "^TASKS_ACTIVE_WAITING$" { "检测到 Codex 任务仍在运行，继续等待。"; break }
+            "^RATE_BLOCKED_WAITING_FOR_IDLE$" { "额度已耗尽，但仍需等待连续空闲满 $($status.IdleThresholdMinutes) 分钟。"; break }
+            "^RATE_BLOCKED_IDLE_CONFIRM_(\d+)$" { "额度已耗尽，任务未活跃且已空闲 $($status.IdleForMinutes) 分钟；确认 $($status.ReadyChecks)/2。"; break }
+            "^IDLE_CONFIRM_(\d+)$" { "任务已空闲 $($status.IdleForMinutes) 分钟；确认 $($status.ReadyChecks)/2。"; break }
+            "^WAITING_FOR_TASKS_OR_IDLE$" { "等待任务结束，或连续空闲满 $($status.IdleThresholdMinutes) 分钟。"; break }
+            default { [string]$status.Decision }
+        }
+
+        $taskProgressLabel.Text = "任务进度：$taskState  会话 $($status.ActiveTurnCount) / 调用 $($status.PendingToolCallCount) / 进程 $($status.ActiveProcessCount)"
+        $quotaProgressLabel.Text = "额度进度：$rateState  $($status.RateLimitText)"
+        $decisionProgressLabel.Text = "当前判断：$decisionText"
+        Set-Status "全局监控中：$decisionText"
+
+        if ($script:globalMonitor -and [bool]$status.ShutdownReady) {
+            $promptKey = "$($status.MonitorStartedAt)|$($status.Decision)|$($status.ReadyChecks)"
+            if ($script:lastShutdownPromptKey -ne $promptKey) {
+                $script:lastShutdownPromptKey = $promptKey
+                Show-ShutdownConfirmation -MonitorStatus $status -ReasonText $decisionText
+            }
+        }
+    } catch {
+        $taskProgressLabel.Text = "任务进度：状态读取失败"
+        $quotaProgressLabel.Text = "额度进度：状态读取失败"
+        $decisionProgressLabel.Text = "当前判断：$($_.Exception.Message)"
     }
 }
 
@@ -220,16 +370,21 @@ function Start-GlobalMonitor {
     $script:lastCodexActivity = Get-Date
     $script:idleMinutesSetting = [int]$idleMinutes.Value
     $script:shutdownDelaySetting = [int]$shutdownSeconds.Value
+    Remove-Item -LiteralPath $script:monitorStatusPath -Force -ErrorAction SilentlyContinue
     Set-SystemAwake
     $keepAwakeTimer.Start()
+    $monitorStatusTimer.Start()
     Start-MonitorProcess -IdleMinutes $script:idleMinutesSetting -ShutdownDelaySeconds $script:shutdownDelaySetting
     Write-AppLog "Global monitor started: idleMinutes=$script:idleMinutesSetting shutdownDelay=$script:shutdownDelaySetting"
     Set-Status "全局监控进程已启动。它会在后台检测所有 Codex 会话。"
+    Update-MonitorProgress
 }
 
 function Stop-GlobalMonitor {
     $script:globalMonitor = $false
     Stop-MonitorProcess
+    $monitorStatusTimer.Stop()
+    Update-MonitorProgress
 }
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -237,8 +392,8 @@ function Stop-GlobalMonitor {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Codex 守夜助手"
 $form.StartPosition = "CenterScreen"
-$form.Size = New-Object System.Drawing.Size(460, 560)
-$form.MinimumSize = New-Object System.Drawing.Size(460, 560)
+$form.Size = New-Object System.Drawing.Size(460, 680)
+$form.MinimumSize = New-Object System.Drawing.Size(460, 680)
 $form.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 248)
 $form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
 
@@ -314,9 +469,37 @@ $powerButton.Location = New-Object System.Drawing.Point(22, 258)
 $powerButton.Size = New-Object System.Drawing.Size(396, 38)
 $form.Controls.Add($powerButton)
 
+$progressTitle = New-Object System.Windows.Forms.Label
+$progressTitle.Text = "全局完成后关机状态"
+$progressTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10, [System.Drawing.FontStyle]::Bold)
+$progressTitle.Location = New-Object System.Drawing.Point(24, 312)
+$progressTitle.Size = New-Object System.Drawing.Size(390, 24)
+$form.Controls.Add($progressTitle)
+
+$taskProgressLabel = New-Object System.Windows.Forms.Label
+$taskProgressLabel.Text = "任务进度：未开启监控"
+$taskProgressLabel.Location = New-Object System.Drawing.Point(24, 340)
+$taskProgressLabel.Size = New-Object System.Drawing.Size(400, 24)
+$taskProgressLabel.ForeColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
+$form.Controls.Add($taskProgressLabel)
+
+$quotaProgressLabel = New-Object System.Windows.Forms.Label
+$quotaProgressLabel.Text = "额度进度：未开启监控"
+$quotaProgressLabel.Location = New-Object System.Drawing.Point(24, 368)
+$quotaProgressLabel.Size = New-Object System.Drawing.Size(400, 24)
+$quotaProgressLabel.ForeColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
+$form.Controls.Add($quotaProgressLabel)
+
+$decisionProgressLabel = New-Object System.Windows.Forms.Label
+$decisionProgressLabel.Text = "当前判断：未开启监控"
+$decisionProgressLabel.Location = New-Object System.Drawing.Point(24, 396)
+$decisionProgressLabel.Size = New-Object System.Drawing.Size(400, 40)
+$decisionProgressLabel.ForeColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
+$form.Controls.Add($decisionProgressLabel)
+
 $idleLabel = New-Object System.Windows.Forms.Label
 $idleLabel.Text = "连续空闲"
-$idleLabel.Location = New-Object System.Drawing.Point(24, 322)
+$idleLabel.Location = New-Object System.Drawing.Point(24, 452)
 $idleLabel.Size = New-Object System.Drawing.Size(130, 24)
 $form.Controls.Add($idleLabel)
 
@@ -324,52 +507,52 @@ $idleMinutes = New-Object System.Windows.Forms.NumericUpDown
 $idleMinutes.Minimum = 1
 $idleMinutes.Maximum = 240
 $idleMinutes.Value = 10
-$idleMinutes.Location = New-Object System.Drawing.Point(160, 320)
+$idleMinutes.Location = New-Object System.Drawing.Point(160, 450)
 $idleMinutes.Size = New-Object System.Drawing.Size(70, 28)
 $form.Controls.Add($idleMinutes)
 
 $idleUnit = New-Object System.Windows.Forms.Label
 $idleUnit.Text = "分钟后关机"
-$idleUnit.Location = New-Object System.Drawing.Point(238, 322)
+$idleUnit.Location = New-Object System.Drawing.Point(238, 452)
 $idleUnit.Size = New-Object System.Drawing.Size(140, 24)
 $form.Controls.Add($idleUnit)
 
 $shutdownLabel = New-Object System.Windows.Forms.Label
-$shutdownLabel.Text = "检测后延迟"
-$shutdownLabel.Location = New-Object System.Drawing.Point(24, 358)
+$shutdownLabel.Text = "确认倒计时"
+$shutdownLabel.Location = New-Object System.Drawing.Point(24, 488)
 $shutdownLabel.Size = New-Object System.Drawing.Size(130, 24)
 $form.Controls.Add($shutdownLabel)
 
 $shutdownSeconds = New-Object System.Windows.Forms.NumericUpDown
-$shutdownSeconds.Minimum = 0
+$shutdownSeconds.Minimum = 60
 $shutdownSeconds.Maximum = 36000
-$shutdownSeconds.Value = 0
+$shutdownSeconds.Value = 60
 $shutdownSeconds.Increment = 30
-$shutdownSeconds.Location = New-Object System.Drawing.Point(160, 356)
+$shutdownSeconds.Location = New-Object System.Drawing.Point(160, 486)
 $shutdownSeconds.Size = New-Object System.Drawing.Size(84, 28)
 $form.Controls.Add($shutdownSeconds)
 
 $shutdownUnit = New-Object System.Windows.Forms.Label
 $shutdownUnit.Text = "秒"
-$shutdownUnit.Location = New-Object System.Drawing.Point(252, 358)
+$shutdownUnit.Location = New-Object System.Drawing.Point(252, 488)
 $shutdownUnit.Size = New-Object System.Drawing.Size(100, 24)
 $form.Controls.Add($shutdownUnit)
 
 $shutdownButton = New-Object System.Windows.Forms.Button
 $shutdownButton.Text = "全局完成后关机"
-$shutdownButton.Location = New-Object System.Drawing.Point(22, 406)
+$shutdownButton.Location = New-Object System.Drawing.Point(22, 536)
 $shutdownButton.Size = New-Object System.Drawing.Size(190, 38)
 $form.Controls.Add($shutdownButton)
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "取消关机/监控"
-$cancelButton.Location = New-Object System.Drawing.Point(228, 406)
+$cancelButton.Location = New-Object System.Drawing.Point(228, 536)
 $cancelButton.Size = New-Object System.Drawing.Size(190, 38)
 $form.Controls.Add($cancelButton)
 
 $testShutdownButton = New-Object System.Windows.Forms.Button
 $testShutdownButton.Text = "测试关机：60 秒后关机"
-$testShutdownButton.Location = New-Object System.Drawing.Point(22, 456)
+$testShutdownButton.Location = New-Object System.Drawing.Point(22, 588)
 $testShutdownButton.Size = New-Object System.Drawing.Size(396, 38)
 $form.Controls.Add($testShutdownButton)
 
@@ -381,67 +564,10 @@ $keepAwakeTimer.Add_Tick({
     }
 })
 
-$monitorWorker = New-Object System.ComponentModel.BackgroundWorker
-$monitorWorker.WorkerReportsProgress = $true
-$monitorWorker.WorkerSupportsCancellation = $true
-
-$monitorWorker.Add_DoWork({
-    param($sender, $e)
-
-    while (-not $sender.CancellationPending -and $script:globalMonitor) {
-        try {
-            Set-SystemAwake
-            $activity = Get-CodexGlobalActivity
-
-            if ($activity.LatestActivity -gt $script:lastCodexActivity) {
-                $script:lastCodexActivity = $activity.LatestActivity
-            }
-
-            if ($activity.ActiveProcessCount -gt 0) {
-                $script:lastCodexActivity = Get-Date
-                Write-AppLog "Monitor: active Codex-launched processes detected: $($activity.ActiveProcessCount)"
-                $sender.ReportProgress(0, "全局监控中：检测到 Codex 拉起的进程仍在运行，继续等待。")
-            } elseif ($activity.RateLimitBlocked) {
-                Write-AppLog "Monitor: rate limit blocked detected"
-                $sender.ReportProgress(0, "检测到额度/速率限制已阻塞，准备自动关机。")
-                $script:globalMonitor = $false
-                Request-Shutdown -DelaySeconds $script:shutdownDelaySetting
-                break
-            } else {
-                $idleFor = ((Get-Date) - $script:lastCodexActivity).TotalMinutes
-                if ($idleFor -ge $script:idleMinutesSetting) {
-                    Write-AppLog "Monitor: idle threshold reached idleFor=$idleFor threshold=$script:idleMinutesSetting"
-                    $sender.ReportProgress(0, "Codex 已连续空闲 $([math]::Round($idleFor, 1)) 分钟，准备自动关机。")
-                    $script:globalMonitor = $false
-                    Request-Shutdown -DelaySeconds $script:shutdownDelaySetting
-                    break
-                }
-                Write-AppLog "Monitor: idleFor=$([math]::Round($idleFor, 2)) threshold=$script:idleMinutesSetting activeProcesses=$($activity.ActiveProcessCount) recentFiles=$($activity.RecentFileCount)"
-                $sender.ReportProgress(0, "全局监控中：最近活动 $([math]::Round($idleFor, 1)) 分钟前；空闲满 $script:idleMinutesSetting 分钟后关机。")
-            }
-        } catch {
-            Write-AppLog "Monitor error: $($_.Exception.Message)"
-            $sender.ReportProgress(0, "全局监控读取失败：$($_.Exception.Message)")
-        }
-
-        for ($i = 0; $i -lt 30; $i++) {
-            if ($sender.CancellationPending -or -not $script:globalMonitor) {
-                break
-            }
-            Start-Sleep -Seconds 1
-        }
-    }
-})
-
-$monitorWorker.Add_ProgressChanged({
-    param($sender, $e)
-    Set-Status ([string]$e.UserState)
-})
-
-$monitorWorker.Add_RunWorkerCompleted({
-    if (-not $script:globalMonitor) {
-        Set-Status "全局监控已停止。"
-    }
+$monitorStatusTimer = New-Object System.Windows.Forms.Timer
+$monitorStatusTimer.Interval = 5000
+$monitorStatusTimer.Add_Tick({
+    Update-MonitorProgress
 })
 
 $keepButton.Add_Click({
@@ -481,7 +607,7 @@ $shutdownButton.Add_Click({
         $idle = [int]$idleMinutes.Value
         $delay = [int]$shutdownSeconds.Value
         $result = [System.Windows.Forms.MessageBox]::Show(
-            "开启后会在后台监控所有 Codex 会话。所有会话连续 $idle 分钟没有活动、且没有监控启动后由 Codex 拉起的进程仍在运行时，将在 $delay 秒后关闭 Windows。",
+            "开启后会监控所有 Codex 会话。只有在未检测到活跃任务，并且连续空闲满 $idle 分钟后，才会弹出确认关机窗口。无人操作 $delay 秒后才会真正关机；点否会取消自动关机。",
             "全局完成后关机",
             [System.Windows.Forms.MessageBoxButtons]::OKCancel,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -526,6 +652,7 @@ $form.Add_FormClosing({
     $script:keepAwake = $false
     Stop-GlobalMonitor
     $keepAwakeTimer.Stop()
+    $monitorStatusTimer.Stop()
     Clear-SystemAwake
 })
 
