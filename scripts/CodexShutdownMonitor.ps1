@@ -79,7 +79,10 @@ function Get-TailJsonLines {
         if ($stream.Length -gt $readSize -and $lines.Count -gt 1) {
             $lines = $lines[1..($lines.Count - 1)]
         }
-        return @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last $Tail)
+        return @($lines |
+            ForEach-Object { ([string]$_).TrimStart([char]0xFEFF) } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Last $Tail)
     } catch {
         @()
     } finally {
@@ -218,20 +221,22 @@ function Get-MaxRateLimitPercent {
 }
 
 function Get-CodexGlobalActivity {
-    param([datetime]$MonitorStartedAt)
+    param([datetime]$MonitorStartedAt, [int]$ActiveGraceMinutes = 10)
 
     $sessionRoot = Join-Path $env:USERPROFILE ".codex\sessions"
     $processManagerPath = Join-Path $env:USERPROFILE ".codex\process_manager\chat_processes.json"
     $scanWindowStart = $MonitorStartedAt.AddHours(-6)
-    $rateWindowStart = $MonitorStartedAt.AddMinutes(-5)
+    $rateWindowStart = (Get-Date).AddHours(-6)
+    $activeCutoff = (Get-Date).AddMinutes(-1 * [math]::Max(2, $ActiveGraceMinutes))
     $latestActivity = $MonitorStartedAt
     $rateLimitBlocked = $false
     $rateLimitText = "rate info unavailable"
     $rateLimitPercent = $null
+    $rateLimitUpdatedAt = $null
     $recentFileCount = 0
     $activeProcessCount = 0
     $pendingToolCalls = @{}
-    $recentTurns = @{}
+    $turnStates = @{}
 
     if (Test-Path -LiteralPath $processManagerPath) {
         try {
@@ -284,11 +289,24 @@ function Get-CodexGlobalActivity {
                     $latestActivity = $eventTime
                 }
 
-                if ($turnId -and $eventTime -and $eventTime -ge $rateWindowStart) {
-                    $recentTurns[$turnId] = $true
+                if ($turnId -and $eventTime -and $eventTime -ge $scanWindowStart) {
+                    if (-not $turnStates.ContainsKey($turnId)) {
+                        $turnStates[$turnId] = [pscustomobject]@{
+                            TurnId = $turnId
+                            Started = $false
+                            Completed = $false
+                            LatestEvent = $eventTime
+                        }
+                    }
+                    if ($eventTime -gt $turnStates[$turnId].LatestEvent) {
+                        $turnStates[$turnId].LatestEvent = $eventTime
+                    }
                 }
 
-                if ($event.type -eq "response_item") {
+                $eventType = [string]$event.type
+                $eventPayloadType = [string]$event.payload.type
+
+                if ($eventType -eq "response_item") {
                     $payloadType = [string]$event.payload.type
                     $callId = [string]$event.payload.call_id
 
@@ -301,18 +319,25 @@ function Get-CodexGlobalActivity {
                     }
                 }
 
-                if ($event.type -eq "event_msg") {
-                    if ($event.payload.type -eq "task_complete" -and $turnId) {
-                        if ($recentTurns.ContainsKey($turnId)) {
-                            $recentTurns.Remove($turnId)
+                if ($eventType -eq "event_msg") {
+                    if ($eventPayloadType -eq "task_started" -and $turnId) {
+                        if ($turnStates.ContainsKey($turnId)) {
+                            $turnStates[$turnId].Started = $true
+                            $turnStates[$turnId].Completed = $false
+                        }
+                    } elseif ($eventPayloadType -eq "task_complete" -and $turnId) {
+                        if ($turnStates.ContainsKey($turnId)) {
+                            $turnStates[$turnId].Completed = $true
                         }
                     }
 
-                    if ($event.payload.type -eq "token_count" -and $eventTime -ge $rateWindowStart) {
-                        $rateLimitText = Get-RateLimitText -RateLimits $event.payload.rate_limits
-                        $rateLimitPercent = Get-MaxRateLimitPercent -RateLimits $event.payload.rate_limits
-                        if (Test-RateLimitBlocked -RateLimits $event.payload.rate_limits) {
-                            $rateLimitBlocked = $true
+                    if ($eventPayloadType -eq "token_count") {
+                        $effectiveRateTime = if ($eventTime) { $eventTime } else { $file.LastWriteTime }
+                        if ($null -eq $rateLimitUpdatedAt -or $effectiveRateTime -gt $rateLimitUpdatedAt) {
+                            $rateLimitUpdatedAt = $effectiveRateTime
+                            $rateLimitText = Get-RateLimitText -RateLimits $event.payload.rate_limits
+                            $rateLimitPercent = Get-MaxRateLimitPercent -RateLimits $event.payload.rate_limits
+                            $rateLimitBlocked = Test-RateLimitBlocked -RateLimits $event.payload.rate_limits
                         }
                     }
                 }
@@ -321,6 +346,17 @@ function Get-CodexGlobalActivity {
     }
 
     $activeTurns = @{}
+    $recentTurns = @{}
+
+    foreach ($state in $turnStates.Values) {
+        if ($state.LatestEvent -and $state.LatestEvent -ge $activeCutoff) {
+            $recentTurns[$state.TurnId] = $true
+            if (-not $state.Completed) {
+                $activeTurns[$state.TurnId] = $true
+            }
+        }
+    }
+
     foreach ($key in @($pendingToolCalls.Keys)) {
         if ([string]::IsNullOrWhiteSpace([string]$key)) {
             $pendingToolCalls.Remove($key)
@@ -341,6 +377,7 @@ function Get-CodexGlobalActivity {
         RateLimitBlocked = $rateLimitBlocked
         RateLimitText = $rateLimitText
         RateLimitUsedPercent = $rateLimitPercent
+        RateLimitUpdatedAt = $rateLimitUpdatedAt
         RecentFileCount = $recentFileCount
     }
 }
@@ -364,6 +401,7 @@ try {
         RateLimitBlocked = $false
         RateLimitText = "initializing"
         RateLimitUsedPercent = $null
+        RateLimitUpdatedAt = $null
         RecentFileCount = 0
         ReadyChecks = 0
         ShutdownReady = $false
@@ -372,7 +410,8 @@ try {
 
     while ($true) {
         Set-SystemAwake
-        $activity = Get-CodexGlobalActivity -MonitorStartedAt $monitorStartedAt
+        $activeGraceMinutes = [math]::Max(2, [math]::Min(30, $IdleMinutes))
+        $activity = Get-CodexGlobalActivity -MonitorStartedAt $monitorStartedAt -ActiveGraceMinutes $activeGraceMinutes
 
         if ($activity.LatestActivity -gt $lastCodexActivity) {
             $lastCodexActivity = $activity.LatestActivity
@@ -380,7 +419,8 @@ try {
 
         $taskActive = (
             $activity.ActiveProcessCount -gt 0 -or
-            $activity.PendingToolCallCount -gt 0
+            $activity.PendingToolCallCount -gt 0 -or
+            $activity.ActiveTurnCount -gt 0
         )
         $idleFor = ((Get-Date) - $lastCodexActivity).TotalMinutes
         $decision = ""
@@ -423,6 +463,7 @@ try {
             RateLimitBlocked = [bool]$activity.RateLimitBlocked
             RateLimitText = $activity.RateLimitText
             RateLimitUsedPercent = $activity.RateLimitUsedPercent
+            RateLimitUpdatedAt = if ($activity.RateLimitUpdatedAt) { $activity.RateLimitUpdatedAt.ToString("yyyy-MM-dd HH:mm:ss") } else { $null }
             RecentFileCount = $activity.RecentFileCount
             ReadyChecks = $readyChecks
             ShutdownReady = $shutdownReady
