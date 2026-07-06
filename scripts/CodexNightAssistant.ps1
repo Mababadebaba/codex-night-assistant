@@ -66,11 +66,19 @@ function Apply-PowerSettings {
 }
 
 function Request-Shutdown {
-    param([int]$DelaySeconds)
+    param([int]$DelaySeconds, [switch]$Force)
     if ($DelaySeconds -lt 0) { $DelaySeconds = 0 }
-    Write-AppLog "Request shutdown: delay=$DelaySeconds"
-    & "$env:SystemRoot\System32\shutdown.exe" /s /t $DelaySeconds /c "Codex appears idle or blocked. Automatic shutdown requested." | Out-Null
-    Write-AppLog "Shutdown command exit code: $LASTEXITCODE"
+    $shutdownArgs = @("/s")
+    if ($Force) {
+        $shutdownArgs += "/f"
+    }
+    $shutdownArgs += @("/t", [string]$DelaySeconds, "/c", "Codex appears idle or blocked. Automatic shutdown requested.")
+
+    Write-AppLog "Request shutdown: delay=$DelaySeconds force=$([bool]$Force)"
+    & "$env:SystemRoot\System32\shutdown.exe" $shutdownArgs | Out-Null
+    $exitCode = $LASTEXITCODE
+    Write-AppLog "Shutdown command exit code: $exitCode"
+    return $exitCode
 }
 
 function Cancel-Shutdown {
@@ -183,7 +191,10 @@ function Show-ShutdownConfirmation {
             $timer.Stop()
             Write-AppLog "Shutdown confirmation countdown elapsed"
             Stop-GlobalMonitor
-            Request-Shutdown -DelaySeconds 0
+            $exitCode = Request-Shutdown -DelaySeconds 0 -Force
+            if ($exitCode -ne 0) {
+                Set-Status "关机命令失败：$exitCode。已停止监控，请查看日志。"
+            }
             $confirmForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $confirmForm.Close()
         }
@@ -193,7 +204,10 @@ function Show-ShutdownConfirmation {
         $timer.Stop()
         Write-AppLog "Shutdown confirmation accepted manually"
         Stop-GlobalMonitor
-        Request-Shutdown -DelaySeconds 0
+        $exitCode = Request-Shutdown -DelaySeconds 0 -Force
+        if ($exitCode -ne 0) {
+            Set-Status "关机命令失败：$exitCode。已停止监控，请查看日志。"
+        }
         $confirmForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $confirmForm.Close()
     })
@@ -674,7 +688,7 @@ $shutdownButton.Add_Click({
         $idle = [int]$idleMinutes.Value
         $delay = [int]$shutdownSeconds.Value
         $result = [System.Windows.Forms.MessageBox]::Show(
-            "开启后会监控所有 Codex 会话。只有在未检测到活跃任务，并且连续空闲满 $idle 分钟后，才会弹出确认关机窗口。无人操作 $delay 秒后才会真正关机；点否会取消自动关机。",
+            "开启后会监控所有 Codex 会话。只有在未检测到活跃任务，并且连续空闲满 $idle 分钟后，才会弹出确认关机窗口。无人操作 $delay 秒后会使用锁屏可用的强制关机参数执行关机；点否会取消自动关机。",
             "全局完成后关机",
             [System.Windows.Forms.MessageBoxButtons]::OKCancel,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -700,14 +714,18 @@ $cancelButton.Add_Click({
 $testShutdownButton.Add_Click({
     try {
         $result = [System.Windows.Forms.MessageBox]::Show(
-            "这会安排 Windows 在 60 秒后关机，用来验证关机命令是否生效。你可以立刻点击取消关机/监控来取消。",
+            "这会安排 Windows 在 60 秒后强制关机，用来验证锁屏/息屏后关机命令是否生效。你可以立刻点击取消关机/监控来取消。",
             "测试关机",
             [System.Windows.Forms.MessageBoxButtons]::OKCancel,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         )
         if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-            Request-Shutdown -DelaySeconds 60
-            Set-Status "测试关机已安排：60 秒后关机。需要取消请点击“取消关机/监控”。"
+            $exitCode = Request-Shutdown -DelaySeconds 60 -Force
+            if ($exitCode -eq 0) {
+                Set-Status "测试关机已安排：60 秒后强制关机。需要取消请点击“取消关机/监控”。"
+            } else {
+                Set-Status "测试关机失败：$exitCode。请查看日志。"
+            }
         }
     } catch {
         Write-AppLog "Test shutdown error: $($_.Exception.Message)"
