@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Fixed unattended shutdown failing after Windows locked the session or entered Modern Standby. Confirmed shutdown now uses the force option required by Windows when the machine is locked.
+- Added shutdown exit-code handling in the UI status so command failures are visible instead of looking like a monitor-state issue.
+- Updated the shutdown test wording and behavior to exercise the same lock-screen-capable shutdown path.
+
 ## 0.1.4
 
 - Fixed stale monitor status being shown after the hidden background monitor process had already stopped.
